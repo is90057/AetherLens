@@ -154,11 +154,14 @@ class AIImageWorker(QThread):
 
         net = cv2.dnn.readNetFromCaffe(prototxt, caffemodel)
 
+        # conv8_313_rh is a Scale layer (bias_term: false): constant weight = 2.606
+        net.getLayer("conv8_313_rh").blobs = [
+            np.full((1, 313, 1, 1), 2.606, dtype=np.float32),
+        ]
+
+        # class8_ab is Convolution 313->2: ab cluster centers weight + zero bias
         pts = np.array(HULL_PTS, dtype=np.float32).reshape(2, 313, 1, 1)
-        class8_ab = net.getLayer("class8_ab")
-        class8_ab.blobs = [pts]
-        conv8_313_rh = net.getLayer("conv8_313_rh")
-        conv8_313_rh.blobs = [np.full((1, 313), 2.606, dtype=np.float32)]
+        net.getLayer("class8_ab").blobs = [pts, np.zeros((2,), dtype=np.float32)]
 
         h, w = img.shape[:2]
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
@@ -173,18 +176,18 @@ class AIImageWorker(QThread):
             mean=50,
         )
         net.setInput(input_blob)
-        result = net.forward()
+        result = net.forward()  # (1, 2, 224, 224)
 
         a = cv2.resize(result[0, 0], (w, h))
         b = cv2.resize(result[0, 1], (w, h))
 
         lab_out = np.zeros((h, w, 3), dtype=np.float32)
-        lab_out[:, :, 0] = L
-        lab_out[:, :, 1] = a * 2 - 128
-        lab_out[:, :, 2] = b * 2 - 128
-        lab_out = np.clip(lab_out, 0, 255)
+        lab_out[:, :, 0] = np.clip(L, 0, 100)
+        lab_out[:, :, 1] = a
+        lab_out[:, :, 2] = b
 
-        rgb_out = cv2.cvtColor(lab_out.astype(np.uint8), cv2.COLOR_Lab2RGB)
+        rgb_out = cv2.cvtColor(lab_out, cv2.COLOR_Lab2RGB)
+        rgb_out = np.clip(rgb_out * 255, 0, 255).astype(np.uint8)
         return cv2.cvtColor(rgb_out, cv2.COLOR_RGB2BGR)
 
     def _style_transfer(self, img):
@@ -831,6 +834,7 @@ class ImageViewer(QMainWindow):
         self.thumbnail_view.setSpacing(15)
         self.thumbnail_view.setWordWrap(True)
         self.thumbnail_view.itemDoubleClicked.connect(self.on_thumbnail_double_clicked)
+        self.thumbnail_view.itemSelectionChanged.connect(self.update_toolbar_state)
         self.thumbnail_view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.thumbnail_view.customContextMenuRequested.connect(self.show_thumbnail_context_menu)
 
