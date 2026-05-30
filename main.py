@@ -6,9 +6,10 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QSplitter, QTreeView,
                              QListWidgetItem, QListView, QComboBox, QWidget, QSizePolicy,
                              QToolBar, QMessageBox, QDialog, QVBoxLayout, QLabel, QMenu,
                              QHBoxLayout, QPushButton, QProgressDialog,
-                             QSlider, QSpinBox, QDoubleSpinBox, QGroupBox, QCheckBox)
+                             QSlider, QSpinBox, QDoubleSpinBox, QGroupBox, QCheckBox,
+                             QScrollArea, QGraphicsPixmapItem, QGraphicsItem, QGraphicsRectItem, QGraphicsTextItem, QTabWidget)
 from PyQt6.QtGui import QPixmap, QAction, QIcon, QTransform, QFileSystemModel, QImageReader, QImage, QPainter, QColor, QPen, QFont, QBrush, QPageSize
-from PyQt6.QtCore import Qt, QDir, QFileInfo, QSize, QThread, pyqtSignal, QSizeF
+from PyQt6.QtCore import Qt, QDir, QFileInfo, QSize, QThread, pyqtSignal, QSizeF, QRectF
 from PyQt6.QtPrintSupport import QPrinter, QPrintDialog
 
 from PIL import Image, ImageOps, ImageFilter, ImageEnhance, ImageDraw, ImageFont
@@ -397,12 +398,25 @@ def pil_to_qimage(pil_img):
     return QImage(data, pil_img.width, pil_img.height, QImage.Format.Format_RGBA8888)
 
 
+class DraggablePixmapItem(QGraphicsPixmapItem):
+    def __init__(self, pixmap, on_move_callback):
+        super().__init__(pixmap)
+        self.on_move_callback = on_move_callback
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges, True)
+
+    def mouseMoveEvent(self, event):
+        super().mouseMoveEvent(event)
+        if self.on_move_callback:
+            self.on_move_callback(self.pos())
+
+
 class SplitPrintDialog(QDialog):
     def __init__(self, image_path, parent=None):
         super().__init__(parent)
         self.image_path = image_path
         self.setWindowTitle("分割列印 - 預覽")
-        self.resize(1000, 700)
+        self.resize(1000, 560)
 
         self.pil_image = Image.open(image_path)
         self.pil_image = ImageOps.exif_transpose(self.pil_image)
@@ -417,37 +431,69 @@ class SplitPrintDialog(QDialog):
         self.cols = 2
         self.rows = 2
 
+        # Scale and offset settings
+        self.img_scale_pct = 100.0  # Scale relative to cover scale (100.0 means cover poster size)
+        self.offset_x = 0.0  # Absolute X offset in mm
+        self.offset_y = 0.0  # Absolute Y offset in mm
+
+        self.is_updating = False
+
+        # We pre-convert PIL image to QPixmap for preview performance
+        self.preview_qpixmap = QPixmap.fromImage(pil_to_qimage(self.pil_image))
+
         self.setup_ui()
+        self.center_image()
         self.update_preview()
 
-    def setup_ui(self):
-        self.resize(1100, 720)
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, 'preview_scene') and self.preview_scene:
+            self.preview_view.fitInView(self.preview_scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
 
+    def setup_ui(self):
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        # --- Preview ---
+        # --- Preview Pane ---
         preview_container = QWidget()
         preview_layout = QVBoxLayout(preview_container)
         preview_layout.setContentsMargins(0, 0, 0, 0)
-        preview_label = QLabel("  📐 分割預覽 (紅線 = 每頁邊界)")
+        
+        preview_label = QLabel("  📐 分割預覽 (滑鼠拖曳可調整圖片位置 / 紅色虛線 = 每頁邊界)")
+        preview_label.setStyleSheet("font-weight: bold; color: #2196F3; font-size: 11px; margin: 2px;")
+        
         self.preview_scene = QGraphicsScene()
         self.preview_view = QGraphicsView(self.preview_scene)
         self.preview_view.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         self.preview_view.setStyleSheet("background: #2d2d2d; border: 1px solid #555;")
+        
         preview_layout.addWidget(preview_label)
         preview_layout.addWidget(self.preview_view)
 
-        # --- Controls ---
+        # --- Controls Sidebar with TabWidget ---
         controls_container = QWidget()
-        controls_container.setMinimumWidth(280)
-        controls_container.setMaximumWidth(320)
+        controls_container.setMinimumWidth(320)
+        controls_container.setMaximumWidth(380)
+
         controls = QVBoxLayout(controls_container)
         controls.setContentsMargins(4, 4, 4, 4)
-        controls.setSpacing(6)
+        controls.setSpacing(4)
 
-        # Paper
+        # Tab Widget
+        tabs = QTabWidget()
+        tabs.setStyleSheet("QTabWidget::pane { border: 1px solid #555; }")
+
+        # Tab 1: Layout Settings
+        tab_layout = QWidget()
+        tab_layout_layout = QVBoxLayout(tab_layout)
+        tab_layout_layout.setContentsMargins(4, 4, 4, 4)
+        tab_layout_layout.setSpacing(6)
+
+        # 1. Paper Settings
         g1 = QGroupBox("紙張設定")
         g1_layout = QVBoxLayout(g1)
+        g1_layout.setContentsMargins(6, 6, 6, 6)
+        g1_layout.setSpacing(4)
+        
         self.paper_combo = QComboBox()
         for k in PAPER_SIZES:
             self.paper_combo.addItem(k, k)
@@ -470,21 +516,25 @@ class SplitPrintDialog(QDialog):
         self.margin_spin.setValue(10)
         self.margin_spin.setSuffix(" mm")
         self.margin_spin.valueChanged.connect(self.on_setting_changed)
-        g1_layout.addWidget(QLabel("邊距:"))
+        g1_layout.addWidget(QLabel("邊距 (Margin):"))
         g1_layout.addWidget(self.margin_spin)
-        controls.addWidget(g1)
+        tab_layout_layout.addWidget(g1)
 
-        # Pages
+        # 2. Split Settings
         g2 = QGroupBox("分割設定")
         g2_layout = QVBoxLayout(g2)
+        g2_layout.setContentsMargins(6, 6, 6, 6)
+        g2_layout.setSpacing(4)
+        
         col_row = QHBoxLayout()
-        col_row.addWidget(QLabel("欄:"))
+        col_row.addWidget(QLabel("欄 (Cols):"))
         self.cols_spin = QSpinBox()
         self.cols_spin.setRange(1, 20)
         self.cols_spin.setValue(2)
         self.cols_spin.valueChanged.connect(self.on_setting_changed)
         col_row.addWidget(self.cols_spin)
-        col_row.addWidget(QLabel("行:"))
+        
+        col_row.addWidget(QLabel("行 (Rows):"))
         self.rows_spin = QSpinBox()
         self.rows_spin.setRange(1, 20)
         self.rows_spin.setValue(2)
@@ -497,21 +547,121 @@ class SplitPrintDialog(QDialog):
         self.overlap_spin.setValue(5)
         self.overlap_spin.setSuffix(" mm")
         self.overlap_spin.valueChanged.connect(self.on_setting_changed)
-        g2_layout.addWidget(QLabel("重疊:"))
+        g2_layout.addWidget(QLabel("重疊 (Overlap):"))
         g2_layout.addWidget(self.overlap_spin)
-        controls.addWidget(g2)
+        tab_layout_layout.addWidget(g2)
+        
+        tab_layout_layout.addStretch()
+        tabs.addTab(tab_layout, "📄 版面分割")
 
-        # Info
+        # Tab 2: Image Sizing
+        tab_img = QWidget()
+        tab_img_layout = QVBoxLayout(tab_img)
+        tab_img_layout.setContentsMargins(4, 4, 4, 4)
+        tab_img_layout.setSpacing(6)
+
+        # 3. Image Sizing & Positions
+        g_img = QGroupBox("圖片尺寸與位置")
+        g_img_layout = QVBoxLayout(g_img)
+        g_img_layout.setContentsMargins(6, 6, 6, 6)
+        g_img_layout.setSpacing(4)
+
+        # Scale Control
+        scale_label = QLabel("圖片比例 (%):")
+        g_img_layout.addWidget(scale_label)
+        scale_row = QHBoxLayout()
+        self.scale_slider = QSlider(Qt.Orientation.Horizontal)
+        self.scale_slider.setRange(10, 500)
+        self.scale_slider.setValue(100)
+        self.scale_slider.valueChanged.connect(self.on_scale_slider_changed)
+        self.scale_spin = QDoubleSpinBox()
+        self.scale_spin.setRange(10.0, 1000.0)
+        self.scale_spin.setValue(100.0)
+        self.scale_spin.setSuffix(" %")
+        self.scale_spin.valueChanged.connect(self.on_scale_spin_changed)
+        scale_row.addWidget(self.scale_slider)
+        scale_row.addWidget(self.scale_spin)
+        g_img_layout.addLayout(scale_row)
+
+        # Offset X Control
+        offset_x_label = QLabel("X 軸偏移 (mm):")
+        g_img_layout.addWidget(offset_x_label)
+        offset_x_row = QHBoxLayout()
+        self.offset_x_slider = QSlider(Qt.Orientation.Horizontal)
+        self.offset_x_slider.setRange(-500, 500)
+        self.offset_x_slider.setValue(0)
+        self.offset_x_slider.valueChanged.connect(self.on_offset_x_slider_changed)
+        self.offset_x_spin = QDoubleSpinBox()
+        self.offset_x_spin.setRange(-1000.0, 1000.0)
+        self.offset_x_spin.setValue(0.0)
+        self.offset_x_spin.setSuffix(" mm")
+        self.offset_x_spin.valueChanged.connect(self.on_offset_spin_changed)
+        offset_x_row.addWidget(self.offset_x_slider)
+        offset_x_row.addWidget(self.offset_x_spin)
+        g_img_layout.addLayout(offset_x_row)
+
+        # Offset Y Control
+        offset_y_label = QLabel("Y 軸偏移 (mm):")
+        g_img_layout.addWidget(offset_y_label)
+        offset_y_row = QHBoxLayout()
+        self.offset_y_slider = QSlider(Qt.Orientation.Horizontal)
+        self.offset_y_slider.setRange(-500, 500)
+        self.offset_y_slider.setValue(0)
+        self.offset_y_slider.valueChanged.connect(self.on_offset_y_slider_changed)
+        self.offset_y_spin = QDoubleSpinBox()
+        self.offset_y_spin.setRange(-1000.0, 1000.0)
+        self.offset_y_spin.setValue(0.0)
+        self.offset_y_spin.setSuffix(" mm")
+        self.offset_y_spin.valueChanged.connect(self.on_offset_spin_changed)
+        offset_y_row.addWidget(self.offset_y_slider)
+        offset_y_row.addWidget(self.offset_y_spin)
+        g_img_layout.addLayout(offset_y_row)
+
+        # Preset buttons
+        preset_layout1 = QHBoxLayout()
+        self.btn_center = QPushButton("🎯 置中")
+        self.btn_center.clicked.connect(self.center_image)
+        self.btn_cover = QPushButton("📺 填滿 (Cover)")
+        self.btn_cover.clicked.connect(self.cover_image)
+        preset_layout1.addWidget(self.btn_center)
+        preset_layout1.addWidget(self.btn_cover)
+        g_img_layout.addLayout(preset_layout1)
+
+        preset_layout2 = QHBoxLayout()
+        self.btn_contain = QPushButton("🔍 適應 (Contain)")
+        self.btn_contain.clicked.connect(self.contain_image)
+        self.btn_1to1 = QPushButton("🔄 1:1 原始")
+        self.btn_1to1.clicked.connect(self.reset_1to1_image)
+        preset_layout2.addWidget(self.btn_contain)
+        preset_layout2.addWidget(self.btn_1to1)
+        g_img_layout.addLayout(preset_layout2)
+
+        tab_img_layout.addWidget(g_img)
+        tab_img_layout.addStretch()
+        tabs.addTab(tab_img, "🖼️ 圖片調整")
+
+        # Tab 3: Page Preview
+        tab_prev = QWidget()
+        tab_prev_layout = QVBoxLayout(tab_prev)
+        tab_prev_layout.setContentsMargins(4, 4, 4, 4)
+        tab_prev_layout.setSpacing(6)
+
+        # 4. Info Panel
         g3 = QGroupBox("資訊")
-        self.info_label = QLabel("載入中...")
-        self.info_label.setWordWrap(True)
         g3_layout = QVBoxLayout(g3)
+        g3_layout.setContentsMargins(6, 6, 6, 6)
+        g3_layout.setSpacing(4)
+        self.info_label = QLabel("載入中...")
+        self.info_label.setStyleSheet("font-size: 11px;")
+        self.info_label.setWordWrap(True)
         g3_layout.addWidget(self.info_label)
-        controls.addWidget(g3)
+        tab_prev_layout.addWidget(g3)
 
-        # Page Preview
+        # 5. Page Preview
         g4 = QGroupBox("單頁預覽")
         g4_layout = QVBoxLayout(g4)
+        g4_layout.setContentsMargins(6, 6, 6, 6)
+        g4_layout.setSpacing(4)
         page_sel = QHBoxLayout()
         page_sel.addWidget(QLabel("頁碼:"))
         self.page_spin = QSpinBox()
@@ -519,23 +669,24 @@ class SplitPrintDialog(QDialog):
         self.page_spin.valueChanged.connect(self.update_page_preview)
         page_sel.addWidget(self.page_spin)
         g4_layout.addLayout(page_sel)
+        
         self.page_preview_label = QLabel()
-        self.page_preview_label.setMinimumSize(200, 200)
-        self.page_preview_label.setStyleSheet(
-            "background: #3d3d3d; border: 1px solid #666;"
-        )
+        self.page_preview_label.setMinimumSize(160, 160)
+        self.page_preview_label.setMaximumSize(200, 200)
+        self.page_preview_label.setStyleSheet("background: #3d3d3d; border: 1px solid #666;")
         self.page_preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         g4_layout.addWidget(self.page_preview_label)
-        controls.addWidget(g4)
+        tab_prev_layout.addWidget(g4)
+        tab_prev_layout.addStretch()
+        tabs.addTab(tab_prev, "🔍 單頁預覽")
 
-        controls.addStretch()
+        controls.addWidget(tabs)
 
-        # Action buttons
+        # Action Buttons
         btn_row = QHBoxLayout()
         self.print_btn = QPushButton("🖨️ 列印")
         self.print_btn.setStyleSheet(
-            "QPushButton { background: #2196F3; color: white; padding: 6px 12px;"
-            " font-weight: bold; border-radius: 3px; }"
+            "QPushButton { background: #2196F3; color: white; padding: 6px 12px; font-weight: bold; border-radius: 3px; }"
             "QPushButton:hover { background: #1976D2; }"
         )
         self.print_btn.clicked.connect(self.do_print)
@@ -547,7 +698,7 @@ class SplitPrintDialog(QDialog):
 
         splitter.addWidget(preview_container)
         splitter.addWidget(controls_container)
-        splitter.setSizes([780, 320])
+        splitter.setSizes([680, 320])
         splitter.setStretchFactor(0, 1)
         splitter.setStretchFactor(1, 0)
 
@@ -564,11 +715,161 @@ class SplitPrintDialog(QDialog):
     def on_setting_changed(self):
         self.paper_key = self.paper_combo.currentData()
         self.orientation = "landscape" if self.landscape_cb.isChecked() else "portrait"
+        
+        # Ensure checkbox states are mutual-exclusive
+        sender = self.sender()
+        if sender == self.portrait_cb and self.portrait_cb.isChecked():
+            self.landscape_cb.blockSignals(True)
+            self.landscape_cb.setChecked(False)
+            self.landscape_cb.blockSignals(False)
+        elif sender == self.landscape_cb and self.landscape_cb.isChecked():
+            self.portrait_cb.blockSignals(True)
+            self.portrait_cb.setChecked(False)
+            self.portrait_cb.blockSignals(False)
+            
         self.margin_mm = self.margin_spin.value()
         self.overlap_mm = self.overlap_spin.value()
         self.cols = self.cols_spin.value()
         self.rows = self.rows_spin.value()
+        
+        self.center_image()
+
+    def center_image(self):
+        pw, ph = self.get_paper_dims()
+        printable_w = pw - 2 * self.margin_mm
+        printable_h = ph - 2 * self.margin_mm
+        step_x = printable_w - self.overlap_mm
+        step_y = printable_h - self.overlap_mm
+        total_w_mm = (self.cols - 1) * step_x + printable_w
+        total_h_mm = (self.rows - 1) * step_y + printable_h
+        
+        img_w, img_h = self.pil_image.size
+        img_w_mm = img_w * 25.4 / PRINT_DPI
+        img_h_mm = img_h * 25.4 / PRINT_DPI
+        
+        cover_scale = max(total_w_mm / img_w_mm, total_h_mm / img_h_mm)
+        scale = cover_scale * (self.img_scale_pct / 100.0)
+        
+        self.offset_x = (total_w_mm - img_w_mm * scale) / 2
+        self.offset_y = (total_h_mm - img_h_mm * scale) / 2
+        
+        self.update_ui_controls()
+        self.update_image_transform()
         self.update_preview()
+
+    def cover_image(self):
+        self.img_scale_pct = 100.0
+        self.center_image()
+
+    def contain_image(self):
+        pw, ph = self.get_paper_dims()
+        printable_w = pw - 2 * self.margin_mm
+        printable_h = ph - 2 * self.margin_mm
+        step_x = printable_w - self.overlap_mm
+        step_y = printable_h - self.overlap_mm
+        total_w_mm = (self.cols - 1) * step_x + printable_w
+        total_h_mm = (self.rows - 1) * step_y + printable_h
+        
+        img_w, img_h = self.pil_image.size
+        img_w_mm = img_w * 25.4 / PRINT_DPI
+        img_h_mm = img_h * 25.4 / PRINT_DPI
+        
+        cover_scale = max(total_w_mm / img_w_mm, total_h_mm / img_h_mm)
+        contain_scale = min(total_w_mm / img_w_mm, total_h_mm / img_h_mm)
+        
+        self.img_scale_pct = (contain_scale / cover_scale) * 100.0
+        self.center_image()
+
+    def reset_1to1_image(self):
+        pw, ph = self.get_paper_dims()
+        printable_w = pw - 2 * self.margin_mm
+        printable_h = ph - 2 * self.margin_mm
+        step_x = printable_w - self.overlap_mm
+        step_y = printable_h - self.overlap_mm
+        total_w_mm = (self.cols - 1) * step_x + printable_w
+        total_h_mm = (self.rows - 1) * step_y + printable_h
+        
+        img_w, img_h = self.pil_image.size
+        img_w_mm = img_w * 25.4 / PRINT_DPI
+        img_h_mm = img_h * 25.4 / PRINT_DPI
+        
+        cover_scale = max(total_w_mm / img_w_mm, total_h_mm / img_h_mm)
+        
+        self.img_scale_pct = (1.0 / cover_scale) * 100.0
+        self.center_image()
+
+    def update_ui_controls(self):
+        self.is_updating = True
+        
+        # Scale
+        self.scale_spin.setValue(self.img_scale_pct)
+        self.scale_slider.setValue(int(max(10, min(500, self.img_scale_pct))))
+        
+        # Offset X
+        self.offset_x_spin.setValue(self.offset_x)
+        self.offset_x_slider.setValue(int(max(-500, min(500, self.offset_x))))
+        
+        # Offset Y
+        self.offset_y_spin.setValue(self.offset_y)
+        self.offset_y_slider.setValue(int(max(-500, min(500, self.offset_y))))
+        
+        self.is_updating = False
+
+    def on_scale_slider_changed(self, val):
+        if self.is_updating:
+            return
+        self.img_scale_pct = float(val)
+        self.update_ui_controls()
+        self.update_image_transform()
+        self.update_info_and_page_preview()
+
+    def on_scale_spin_changed(self, val):
+        if self.is_updating:
+            return
+        self.img_scale_pct = val
+        self.update_ui_controls()
+        self.update_image_transform()
+        self.update_info_and_page_preview()
+
+    def on_offset_x_slider_changed(self, val):
+        if self.is_updating:
+            return
+        self.offset_x = float(val)
+        self.update_ui_controls()
+        self.update_image_transform()
+        self.update_info_and_page_preview()
+
+    def on_offset_y_slider_changed(self, val):
+        if self.is_updating:
+            return
+        self.offset_y = float(val)
+        self.update_ui_controls()
+        self.update_image_transform()
+        self.update_info_and_page_preview()
+
+    def on_offset_spin_changed(self, val):
+        if self.is_updating:
+            return
+        self.offset_x = self.offset_x_spin.value()
+        self.offset_y = self.offset_y_spin.value()
+        self.update_ui_controls()
+        self.update_image_transform()
+        self.update_info_and_page_preview()
+
+    def on_image_dragged(self, pos):
+        if self.is_updating:
+            return
+        self.offset_x = pos.x()
+        self.offset_y = pos.y()
+        
+        self.is_updating = True
+        self.offset_x_spin.setValue(self.offset_x)
+        self.offset_x_slider.setValue(int(max(-500, min(500, self.offset_x))))
+        self.offset_y_spin.setValue(self.offset_y)
+        self.offset_y_slider.setValue(int(max(-500, min(500, self.offset_y))))
+        self.is_updating = False
+        
+        self.update_info_and_page_preview()
 
     def calculate_layout(self):
         pw, ph = self.get_paper_dims()
@@ -581,18 +882,29 @@ class SplitPrintDialog(QDialog):
         img_w_mm = img_w * 25.4 / PRINT_DPI
         img_h_mm = img_h * 25.4 / PRINT_DPI
 
-        # Scale image to cover the total poster grid (may crop edges)
+        # Cover scale
         total_w_mm = (self.cols - 1) * step_x + printable_w
         total_h_mm = (self.rows - 1) * step_y + printable_h
-        scale = max(total_w_mm / img_w_mm, total_h_mm / img_h_mm)
+        cover_scale = max(total_w_mm / img_w_mm, total_h_mm / img_h_mm)
+        scale = cover_scale * (self.img_scale_pct / 100.0)
 
-        px_per_mm = PRINT_DPI / 25.4
+        img_w_mm_scaled = img_w_mm * scale
+        img_h_mm_scaled = img_h_mm * scale
 
         pages = []
         for r in range(self.rows):
             for c in range(self.cols):
                 x_mm = c * step_x
                 y_mm = r * step_y
+                
+                # Check intersection
+                x_start = max(x_mm, self.offset_x)
+                x_end = min(x_mm + printable_w, self.offset_x + img_w_mm_scaled)
+                y_start = max(y_mm, self.offset_y)
+                y_end = min(y_mm + printable_h, self.offset_y + img_h_mm_scaled)
+                
+                has_image = (x_start < x_end) and (y_start < y_end)
+                
                 pages.append({
                     "x_mm": x_mm,
                     "y_mm": y_mm,
@@ -601,10 +913,11 @@ class SplitPrintDialog(QDialog):
                     "col": c,
                     "row": r,
                     "index": r * self.cols + c + 1,
-                    "has_image": (
-                        x_mm < img_w_mm * scale and y_mm < img_h_mm * scale
-                        and x_mm + printable_w > 0 and y_mm + printable_h > 0
-                    ),
+                    "has_image": has_image,
+                    "x_start": x_start,
+                    "x_end": x_end,
+                    "y_start": y_start,
+                    "y_end": y_end,
                 })
 
         return {
@@ -618,108 +931,240 @@ class SplitPrintDialog(QDialog):
             "total_h_mm": total_h_mm,
             "img_w_mm": img_w_mm,
             "img_h_mm": img_h_mm,
+            "img_w_mm_scaled": img_w_mm_scaled,
+            "img_h_mm_scaled": img_h_mm_scaled,
             "step_x": step_x,
             "step_y": step_y,
             "scale": scale,
             "px_per_mm": PRINT_DPI / 25.4,
-            "orig_px_per_mm": img_w / (img_w_mm * scale),
-            "orig_px_mm_y": img_h / (img_h_mm * scale),
         }
 
-    def update_preview(self):
-        self.preview_scene.clear()
-        info = self.calculate_layout()
-
+    def check_page_has_image(self, c, r):
+        pw, ph = self.get_paper_dims()
+        printable_w = pw - 2 * self.margin_mm
+        printable_h = ph - 2 * self.margin_mm
+        step_x = printable_w - self.overlap_mm
+        step_y = printable_h - self.overlap_mm
+        
+        x_mm = c * step_x
+        y_mm = r * step_y
+        
         img_w, img_h = self.pil_image.size
-        w_ratio = info["orig_px_per_mm"]
-        h_ratio = info["orig_px_mm_y"]
+        img_w_mm = img_w * 25.4 / PRINT_DPI
+        img_h_mm = img_h * 25.4 / PRINT_DPI
+        
+        # Cover scale
+        total_w_mm = (self.cols - 1) * step_x + printable_w
+        total_h_mm = (self.rows - 1) * step_y + printable_h
+        cover_scale = max(total_w_mm / img_w_mm, total_h_mm / img_h_mm)
+        scale = cover_scale * (self.img_scale_pct / 100.0)
+        
+        img_w_mm_scaled = img_w_mm * scale
+        img_h_mm_scaled = img_h_mm * scale
+        
+        x_start = max(x_mm, self.offset_x)
+        x_end = min(x_mm + printable_w, self.offset_x + img_w_mm_scaled)
+        y_start = max(y_mm, self.offset_y)
+        y_end = min(y_mm + printable_h, self.offset_y + img_h_mm_scaled)
+        
+        return (x_start < x_end) and (y_start < y_end)
 
-        # Render full image on a canvas at preview resolution
-        vp = self.preview_view.viewport()
-        max_w = max(vp.width() - 10, 200) if vp else 600
-        max_h = max(vp.height() - 10, 200) if vp else 500
-        pscale = min(max_w / max(img_w, 1), max_h / max(img_h, 1), 1.0)
+    def update_image_transform(self):
+        if hasattr(self, 'img_item') and self.img_item:
+            pw, ph = self.get_paper_dims()
+            printable_w = pw - 2 * self.margin_mm
+            printable_h = ph - 2 * self.margin_mm
+            step_x = printable_w - self.overlap_mm
+            step_y = printable_h - self.overlap_mm
+            total_w_mm = (self.cols - 1) * step_x + printable_w
+            total_h_mm = (self.rows - 1) * step_y + printable_h
+            
+            img_w, img_h = self.pil_image.size
+            img_w_mm = img_w * 25.4 / PRINT_DPI
+            img_h_mm = img_h * 25.4 / PRINT_DPI
+            
+            cover_scale = max(total_w_mm / img_w_mm, total_h_mm / img_h_mm)
+            self.scale = cover_scale * (self.img_scale_pct / 100.0)
+            
+            s_factor = (25.4 / PRINT_DPI) * self.scale
+            
+            self.is_updating = True
+            self.img_item.setTransform(QTransform().scale(s_factor, s_factor))
+            self.img_item.setPos(self.offset_x, self.offset_y)
+            self.is_updating = False
 
-        pw = max(int(img_w * pscale), 1)
-        ph = max(int(img_h * pscale), 1)
-        canvas = self.pil_image.resize((pw, ph), Image.LANCZOS)
+    def update_preview(self):
+        self.is_updating = True
+        self.preview_scene.clear()
+        
+        # 1. Re-add image item
+        self.img_item = DraggablePixmapItem(self.preview_qpixmap, self.on_image_dragged)
+        self.img_item.setZValue(1)
+        self.preview_scene.addItem(self.img_item)
+        
+        # Apply transform and position
+        self.update_image_transform()
+        
+        # 2. Draw grids & paper sheets
+        pw, ph = self.get_paper_dims()
+        printable_w = pw - 2 * self.margin_mm
+        printable_h = ph - 2 * self.margin_mm
+        step_x = printable_w - self.overlap_mm
+        step_y = printable_h - self.overlap_mm
+        
+        total_w_mm = (self.cols - 1) * step_x + printable_w
+        total_h_mm = (self.rows - 1) * step_y + printable_h
+        
+        self.grid_rect_items = {}
+        self.grid_text_items = {}
+        
+        for r in range(self.rows):
+            for c in range(self.cols):
+                # Physical sheet rect
+                sheet_rect = QRectF(c * step_x - self.margin_mm, r * step_y - self.margin_mm, pw, ph)
+                sheet_item = QGraphicsRectItem(sheet_rect)
+                sheet_item.setBrush(QBrush(QColor(255, 255, 255, 20))) # Semi-transparent paper white
+                sheet_item.setPen(QPen(QColor(150, 150, 150, 100), 0.5, Qt.PenStyle.SolidLine))
+                sheet_item.setZValue(2)
+                self.preview_scene.addItem(sheet_item)
+                
+                # Printable area rect
+                printable_rect = QRectF(c * step_x, r * step_y, printable_w, printable_h)
+                print_item = QGraphicsRectItem(printable_rect)
+                
+                has_image = self.check_page_has_image(c, r)
+                color = QColor(230, 50, 50) if has_image else QColor(180, 180, 180, 100)
+                pen_style = Qt.PenStyle.DashLine if has_image else Qt.PenStyle.DotLine
+                
+                print_item.setPen(QPen(color, 0.8, pen_style))
+                print_item.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+                print_item.setZValue(3)
+                self.preview_scene.addItem(print_item)
+                self.grid_rect_items[(c, r)] = print_item
+                
+                # Page number
+                text_item = QGraphicsTextItem(f"P{r * self.cols + c + 1}")
+                text_item.setDefaultTextColor(color)
+                font = QFont("Helvetica", 7, QFont.Weight.Bold)
+                text_item.setFont(font)
+                text_item.setPos(c * step_x + 2, r * step_y + 1)
+                text_item.setZValue(4)
+                self.preview_scene.addItem(text_item)
+                self.grid_text_items[(c, r)] = text_item
+                
+        # Set scene Rect to cover sheets + margins + 10mm padding
+        margin_mm = self.margin_mm
+        scene_rect = QRectF(-margin_mm, -margin_mm, total_w_mm + 2 * margin_mm, total_h_mm + 2 * margin_mm)
+        self.preview_scene.setSceneRect(scene_rect.adjusted(-10, -10, 10, 10))
+        self.preview_view.fitInView(self.preview_scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        
+        self.is_updating = False
+        
+        self.update_info_and_page_preview()
 
-        # Draw page grid
-        d = ImageDraw.Draw(canvas)
-        try:
-            font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc",
-                                      max(11, int(14 * pscale)))
-        except Exception:
-            font = None
+    def update_grid_colors(self):
+        if not hasattr(self, 'grid_rect_items'):
+            return
+        for r in range(self.rows):
+            for c in range(self.cols):
+                if (c, r) in self.grid_rect_items:
+                    has_image = self.check_page_has_image(c, r)
+                    color = QColor(230, 50, 50) if has_image else QColor(180, 180, 180, 100)
+                    pen_style = Qt.PenStyle.DashLine if has_image else Qt.PenStyle.DotLine
+                    
+                    self.grid_rect_items[(c, r)].setPen(QPen(color, 0.8, pen_style))
+                    if (c, r) in self.grid_text_items:
+                        self.grid_text_items[(c, r)].setDefaultTextColor(color)
 
-        lw = max(2, int(3 * pscale))
-        for p in info["pages"]:
-            x1 = p["x_mm"] * w_ratio * pscale
-            y1 = p["y_mm"] * h_ratio * pscale
-            x2 = (p["x_mm"] + p["w_mm"]) * w_ratio * pscale
-            y2 = (p["y_mm"] + p["h_mm"]) * h_ratio * pscale
-
-            cx1 = max(0, int(x1)); cy1 = max(0, int(y1))
-            cx2 = min(pw, int(x2)); cy2 = min(ph, int(y2))
-            if cx2 <= cx1 or cy2 <= cy1:
-                continue
-
-            d.rectangle([cx1, cy1, cx2, cy2], outline=(220, 40, 40), width=lw)
-
-            if font:
-                d.text((cx1 + 4, cy1 + 2), f"P{p['index']}", fill=(220, 40, 40), font=font)
-
-        qimg = pil_to_qimage(canvas)
-        pixmap = QPixmap.fromImage(qimg)
-        item = self.preview_scene.addPixmap(pixmap)
-        self.preview_scene.setSceneRect(item.boundingRect())
-
-        # Update info
-        pp = info
-        total_pages = pp["cols"] * pp["rows"]
-        has_img_count = sum(1 for p in pp["pages"] if p["has_image"])
+    def update_info_and_page_preview(self):
+        info = self.calculate_layout()
+        img_w, img_h = self.pil_image.size
+        
+        total_pages = info["cols"] * info["rows"]
+        has_img_count = sum(1 for p in info["pages"] if p["has_image"])
+        
         self.info_label.setText(
             f"原始尺寸: {img_w}x{img_h} px\n"
-            f"({pp['img_w_mm']:.0f}x{pp['img_h_mm']:.0f} mm @ {PRINT_DPI} DPI)\n"
-            f"列印比例: {pp['scale_pct']:.1f}%\n"
-            f"頁數: {pp['cols']} x {pp['rows']} = {total_pages} ({has_img_count} 有效)\n"
-            f"每頁: {pp['printable_w_mm']:.0f}x{pp['printable_h_mm']:.0f} mm"
+            f"({info['img_w_mm']:.0f}x{info['img_h_mm']:.0f} mm @ {PRINT_DPI} DPI)\n"
+            f"目前尺寸: {info['img_w_mm_scaled']:.0f}x{info['img_h_mm_scaled']:.0f} mm\n"
+            f"列印比例: {info['scale_pct']:.1f}%\n"
+            f"X 軸偏移: {self.offset_x:.1f} mm\n"
+            f"Y 軸偏移: {self.offset_y:.1f} mm\n"
+            f"頁數: {info['cols']} x {info['rows']} = {total_pages} ({has_img_count} 有效)\n"
+            f"每頁: {info['printable_w_mm']:.0f}x{info['printable_h_mm']:.0f} mm"
         )
-
-        total = len(pp["pages"])
+        
         self.page_spin.blockSignals(True)
-        self.page_spin.setRange(1, max(total, 1))
+        self.page_spin.setRange(1, max(total_pages, 1))
         self.page_spin.blockSignals(False)
+        
+        self.update_grid_colors()
         self.update_page_preview()
 
     def render_page_pixmap(self, page_info):
         """Render a single page as a QPixmap for preview."""
+        if not page_info["has_image"]:
+            return QPixmap()
+
         info = self.calculate_layout()
         img_w, img_h = self.pil_image.size
-        rx = info["orig_px_per_mm"]
-        ry = info["orig_px_mm_y"]
+        
+        rx = PRINT_DPI / (25.4 * info["scale"])
+        ry = rx
 
-        x0 = int(page_info["x_mm"] * rx)
-        y0 = int(page_info["y_mm"] * ry)
-        cw = int(page_info["w_mm"] * rx)
-        ch = int(page_info["h_mm"] * ry)
+        # Relative to image top-left (offset_x, offset_y)
+        x_img_mm_start = page_info["x_start"] - self.offset_x
+        x_img_mm_end = page_info["x_end"] - self.offset_x
+        y_img_mm_start = page_info["y_start"] - self.offset_y
+        y_img_mm_end = page_info["y_end"] - self.offset_y
 
-        x0 = max(0, x0)
-        y0 = max(0, y0)
-        cw = min(cw, img_w - x0)
-        ch = min(ch, img_h - y0)
+        # Pixels on original image
+        x0 = max(0, min(img_w, int(x_img_mm_start * rx)))
+        y0 = max(0, min(img_h, int(y_img_mm_start * ry)))
+        x1 = max(0, min(img_w, int(x_img_mm_end * rx)))
+        y1 = max(0, min(img_h, int(y_img_mm_end * ry)))
+
+        cw = x1 - x0
+        ch = y1 - y0
 
         if cw <= 0 or ch <= 0:
             return QPixmap()
 
-        crop = self.pil_image.crop((x0, y0, x0 + cw, y0 + ch))
-        qimg = pil_to_qimage(crop)
-        pm = QPixmap.fromImage(qimg)
-        return pm.scaled(
-            260, 260,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
+        crop = self.pil_image.crop((x0, y0, x1, y1))
+        
+        # Physical sheet dimensions
+        pw, ph = self.get_paper_dims()
+        preview_scale = 160.0 / max(pw, ph)
+        
+        paper_w_px = int(pw * preview_scale)
+        paper_h_px = int(ph * preview_scale)
+        
+        page_img = Image.new("RGB", (paper_w_px, paper_h_px), (255, 255, 255))
+        
+        # Paste the crop inside the printable area
+        dx1 = page_info["x_start"] - page_info["x_mm"]
+        dy1 = page_info["y_start"] - page_info["y_mm"]
+        
+        px_x = int((self.margin_mm + dx1) * preview_scale)
+        px_y = int((self.margin_mm + dy1) * preview_scale)
+        px_w = int((page_info["x_end"] - page_info["x_start"]) * preview_scale)
+        px_h = int((page_info["y_end"] - page_info["y_start"]) * preview_scale)
+        
+        if px_w > 0 and px_h > 0:
+            crop_resized = crop.resize((px_w, px_h), Image.Resampling.LANCZOS)
+            page_img.paste(crop_resized, (px_x, px_y))
+            
+        d = ImageDraw.Draw(page_img)
+        d.rectangle([0, 0, paper_w_px - 1, paper_h_px - 1], outline=(200, 200, 200), width=1)
+        
+        mx = int(self.margin_mm * preview_scale)
+        my = int(self.margin_mm * preview_scale)
+        pw_print = int(page_info["w_mm"] * preview_scale)
+        ph_print = int(page_info["h_mm"] * preview_scale)
+        d.rectangle([mx, my, mx + pw_print - 1, my + ph_print - 1], outline=(220, 150, 150), width=1)
+        
+        qimg = pil_to_qimage(page_img)
+        return QPixmap.fromImage(qimg)
 
     def update_page_preview(self):
         info = self.calculate_layout()
@@ -759,33 +1204,53 @@ class SplitPrintDialog(QDialog):
             if not p["has_image"]:
                 continue
 
-            # Page region in mm -> crop region in original image pixels
             img_w, img_h = self.pil_image.size
-            rx = info["orig_px_per_mm"]
-            ry = info["orig_px_mm_y"]
-            x0 = int(p["x_mm"] * rx)
-            y0 = int(p["y_mm"] * ry)
-            cw = int(p["w_mm"] * rx)
-            ch = int(p["h_mm"] * ry)
+            rx = PRINT_DPI / (25.4 * info["scale"])
+            ry = rx
+            
+            x_img_mm_start = p["x_start"] - self.offset_x
+            x_img_mm_end = p["x_end"] - self.offset_x
+            y_img_mm_start = p["y_start"] - self.offset_y
+            y_img_mm_end = p["y_end"] - self.offset_y
 
-            x0 = max(0, x0)
-            y0 = max(0, y0)
-            cw = min(cw, img_w - x0)
-            ch = min(ch, img_h - y0)
+            x0 = max(0, min(img_w, int(x_img_mm_start * rx)))
+            y0 = max(0, min(img_h, int(y_img_mm_start * ry)))
+            x1 = max(0, min(img_w, int(x_img_mm_end * rx)))
+            y1 = max(0, min(img_h, int(y_img_mm_end * ry)))
+
+            cw = x1 - x0
+            ch = y1 - y0
 
             if cw <= 0 or ch <= 0:
                 continue
 
-            crop = self.pil_image.crop((x0, y0, x0 + cw, y0 + ch))
+            crop = self.pil_image.crop((x0, y0, x1, y1))
             qimg = pil_to_qimage(crop)
-            pm = QPixmap.fromImage(qimg).scaled(
-                page_w, page_h,
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
+            pm = QPixmap.fromImage(qimg)
+            
+            dx1 = p["x_start"] - p["x_mm"]
+            dy1 = p["y_start"] - p["y_mm"]
+            
+            pos_x_mm = self.margin_mm + dx1
+            pos_y_mm = self.margin_mm + dy1
+            width_mm = p["x_end"] - p["x_start"]
+            height_mm = p["y_end"] - p["y_start"]
+            
+            dots_per_mm_x = page_w / pw
+            dots_per_mm_y = page_h / ph
+            
+            draw_x = pos_x_mm * dots_per_mm_x
+            draw_y = pos_y_mm * dots_per_mm_y
+            draw_w = width_mm * dots_per_mm_x
+            draw_h = height_mm * dots_per_mm_y
+            
+            pm_scaled = pm.scaled(
+                int(draw_w), int(draw_h),
+                Qt.AspectRatioMode.IgnoreAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
             )
-            x = (page_w - pm.width()) // 2
-            y = (page_h - pm.height()) // 2
-            painter.drawPixmap(int(x), int(y), pm)
+            
+            painter.drawPixmap(int(draw_x), int(draw_y), pm_scaled)
 
             printed += 1
             if printed < sum(1 for pp in info["pages"] if pp["has_image"]):
